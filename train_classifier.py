@@ -5,19 +5,22 @@ import sys
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, TensorDataset, random_split
+from torch.utils.data import DataLoader, TensorDataset
 from tqdm import tqdm
 import matplotlib.pyplot as plt
+import argparse
+from sklearn.metrics import r2_score, mean_absolute_error
+
 from data_loader import STEADDataset
 from magnet import MagNet
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 BATCH_SIZE = 64
-EPOCHS = 20
-LR = 1e-3
 
-def train_magnet(use_synthetic=False):
+def train_magnet(use_synthetic=False, epochs=100, patience=10):
     print(f"\n--- Training MagNet (Synthetic Augmented: {use_synthetic}) ---")
+    print(f"Configuration: Epochs={epochs}, Patience={patience}")
+    
     csv_path = "STEAD/merge.csv"
     hdf5_path = "STEAD/merge.hdf5"
     
@@ -29,13 +32,13 @@ def train_magnet(use_synthetic=False):
         print("Real data not found.")
         return
 
-    # We need a custom way to get data + labels (magnitude)
-    # The current STEADDataset only returns waveforms.
+    # Load Real Data
     print("Loading Real Data...")
     full_dataset = STEADDataset(csv_path, hdf5_path)
     
     # Use DataLoader for faster loading
-    temp_loader = DataLoader(full_dataset, batch_size=100, num_workers=4, shuffle=False)
+    # num_workers=0 to avoid Windows deadlock
+    temp_loader = DataLoader(full_dataset, batch_size=100, num_workers=0, shuffle=False)
     
     real_waveforms = []
     real_labels = []
@@ -47,20 +50,19 @@ def train_magnet(use_synthetic=False):
         
     real_X = torch.tensor(np.concatenate(real_waveforms), dtype=torch.float32)
     real_y = torch.tensor(np.concatenate(real_labels), dtype=torch.float32).unsqueeze(1)
-        
-    real_X = torch.tensor(np.concatenate(real_waveforms), dtype=torch.float32)
-    real_y = torch.tensor(np.concatenate(real_labels), dtype=torch.float32).unsqueeze(1)
     
     print(f"Real Data: {real_X.shape}, Labels: {real_y.shape}")
     
-    # Split Real into Train/Test
-    train_size = int(0.8 * len(real_X))
-    test_size = len(real_X) - train_size
+    # Split Real into Train/Val/Test (70/15/15)
+    total_len = len(real_X)
+    train_len = int(0.7 * total_len)
+    val_len = int(0.15 * total_len)
+    test_len = total_len - train_len - val_len
     
-    real_train_X, real_test_X = torch.split(real_X, [train_size, test_size])
-    real_train_y, real_test_y = torch.split(real_y, [train_size, test_size])
+    real_train_X, real_val_X, real_test_X = torch.split(real_X, [train_len, val_len, test_len])
+    real_train_y, real_val_y, real_test_y = torch.split(real_y, [train_len, val_len, test_len])
     
-    # 2. Load Synthetic Data (if enabled)
+    # Load Synthetic Data (if enabled)
     if use_synthetic:
         syn_path = "results/generated/synthetic_data.npy"
         syn_label_path = "results/generated/synthetic_labels.npy"
@@ -86,25 +88,32 @@ def train_magnet(use_synthetic=False):
         train_y = real_train_y
         
     print(f"Training Set: {train_X.shape}")
+    print(f"Validation Set: {real_val_X.shape} (Always Real)")
     print(f"Test Set: {real_test_X.shape} (Always Real)")
     
     # Dataloaders
     train_ds = TensorDataset(train_X, train_y)
+    val_ds = TensorDataset(real_val_X, real_val_y)
     test_ds = TensorDataset(real_test_X, real_test_y)
     
     train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True)
+    val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE)
     test_loader = DataLoader(test_ds, batch_size=BATCH_SIZE)
     
     # Model
     model = MagNet().to(DEVICE)
-    optimizer = optim.Adam(model.parameters(), lr=LR)
+    optimizer = optim.Adam(model.parameters(), lr=1e-3)
     criterion = nn.MSELoss()
     
     # Train
     train_losses = []
-    test_losses = []
+    val_losses = []
     
-    for epoch in range(EPOCHS):
+    best_val_loss = float('inf')
+    patience_counter = 0
+    best_model_state = None
+    
+    for epoch in range(epochs):
         model.train()
         epoch_loss = 0
         for x, y in train_loader:
@@ -121,23 +130,39 @@ def train_magnet(use_synthetic=False):
         avg_train_loss = epoch_loss / len(train_loader)
         train_losses.append(avg_train_loss)
         
-        # Evaluate
+        # Validation
         model.eval()
-        test_loss = 0
+        val_loss = 0
         with torch.no_grad():
-            for x, y in test_loader:
+            for x, y in val_loader:
                 x, y = x.to(DEVICE), y.to(DEVICE)
                 pred = model(x)
                 loss = criterion(pred, y)
-                test_loss += loss.item()
+                val_loss += loss.item()
         
-        avg_test_loss = test_loss / len(test_loader)
-        test_losses.append(avg_test_loss)
+        avg_val_loss = val_loss / len(val_loader)
+        val_losses.append(avg_val_loss)
         
-        if (epoch+1) % 5 == 0:
-            print(f"Epoch {epoch+1}: Train MSE={avg_train_loss:.4f}, Test MSE={avg_test_loss:.4f}, Test RMSE={np.sqrt(avg_test_loss):.4f}")
-            
-    from sklearn.metrics import r2_score, mean_absolute_error
+        print(f"Epoch {epoch+1}/{epochs}: Train MSE={avg_train_loss:.4f}, Val MSE={avg_val_loss:.4f}")
+        
+        # Early Stopping Check
+        if avg_val_loss < best_val_loss:
+            best_val_loss = avg_val_loss
+            patience_counter = 0
+            best_model_state = model.state_dict()
+            # Save best model immediately
+            suffix = "augmented" if use_synthetic else "baseline"
+            torch.save(best_model_state, f"results/magnet_{suffix}_best.pth")
+        else:
+            patience_counter += 1
+            if patience_counter >= patience:
+                print(f"Early stopping triggered at epoch {epoch+1}")
+                break
+                
+    # Load best model for testing
+    if best_model_state is not None:
+        print("Loading best model for testing...")
+        model.load_state_dict(best_model_state)
     
     # Final Evaluation on Test Set
     model.eval()
@@ -170,16 +195,16 @@ def train_magnet(use_synthetic=False):
     
     plt.figure()
     plt.plot(train_losses, label="Train")
-    plt.plot(test_losses, label="Test")
+    plt.plot(val_losses, label="Validation")
     plt.legend()
     plt.title(f"MagNet Training ({suffix})")
     plt.savefig(f"results/magnet_loss_{suffix}.png")
 
-import argparse
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--augmented", action="store_true", help="Train on Real + Synthetic data")
+    parser.add_argument("--epochs", type=int, default=100, help="Number of epochs")
+    parser.add_argument("--patience", type=int, default=10, help="Early stopping patience")
     args = parser.parse_args()
     
-    train_magnet(use_synthetic=args.augmented)
+    train_magnet(use_synthetic=args.augmented, epochs=args.epochs, patience=args.patience)
