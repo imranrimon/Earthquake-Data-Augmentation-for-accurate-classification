@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+STEAD/
+results/
+*.hdf5
+*.csv
+*.pt
+*.pth
+*.png
+*.npy
