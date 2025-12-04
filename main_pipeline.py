@@ -1,35 +1,4 @@
 import os
-os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
-import subprocess
-import sys
-
-def run_step(script_cmd, description):
-    print(f"\n{'='*20} {description} {'='*20}")
-    try:
-        # Use the current python executable
-        cmd = [sys.executable]
-        if isinstance(script_cmd, list):
-            cmd.extend(script_cmd)
-        else:
-            cmd.append(script_cmd)
-            
-        subprocess.check_call(cmd)
-        print(f"{description} completed successfully.")
-    except subprocess.CalledProcessError as e:
-        print(f"Error running {script_cmd}: {e}")
-        sys.exit(1)
-
-def main():
-    print("Starting Seismic DDPM Pipeline...")
-    
-    # 1. Extraction
-    if os.path.exists("STEAD/merge.hdf5"):
-        print("Data found (merge.hdf5). Skipping extraction.")
-    elif not os.path.exists("STEAD/chunk2.hdf5"):
-        run_step("extract_data.py", "Extracting Data")
-    else:
-        print("Data already extracted.")
-import os
 import subprocess
 import sys
 
