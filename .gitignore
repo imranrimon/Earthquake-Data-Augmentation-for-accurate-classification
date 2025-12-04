@@ -1,10 +1,6 @@
 __pycache__/
 *.pyc
 STEAD/
-results/
+results/generated/synthetic_data.npy
 *.hdf5
 *.csv
-*.pt
-*.pth
-*.png
-*.npy
